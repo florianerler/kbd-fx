@@ -1,0 +1,33 @@
+# kbd-fx Konfiguration. Nicht gesetzte Werte nehmen die Standardwerte.
+# Nach Aenderungen:  systemctl --user restart kbd-fx
+
+[device]
+led = "platform::kbd_backlight"
+keyboard = "/dev/input/by-path/platform-i8042-serio-0-event-kbd"
+
+[evening]            # abends beim Tippen dim, nach typing_timeout Sekunden wieder aus
+start = "19:00"
+end = "07:00"
+typing_timeout = 5.0
+
+[cpu]                # Puls ab "on" % Last fuer "sustain" Sekunden, Ende unter "off" %
+enabled = true
+on = 70.0
+off = 60.0
+sustain = 5
+period_slow = 1.5    # Sekunden pro Puls bei "on" %
+period_fast = 0.3    # Sekunden pro Puls bei 100 %
+
+[battery]
+enabled = true
+warn = 20            # Warnblinks bei <=20 %, dann alle 5 % weniger
+critical = 10        # Dauer-Herzschlag bei <=10 % ohne Netzteil
+breathe_seconds = 10.0
+poll = 2.0
+
+[hyprland]
+enabled = true
+workspace = true     # Workspace-Wechsel: 1 Blink
+urgent = true        # dringendes Fenster: 2 Blinks
+monitor = true       # Monitor an/ab: 3 Blinks
+fullscreen = true    # Fullscreen an/aus: 1 langer Blink

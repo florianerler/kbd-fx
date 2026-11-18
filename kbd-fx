@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""kbd-fx: Effekte fuer die (einfarbige, 3-stufige) Tastaturbeleuchtung.
+
+Prioritaeten (hoechste zuerst):
+  1. Akku kritisch       -> Dauer-Herzschlag (ueberstimmt alles)
+  2. Overlay-Blinks      -> Hyprland-Events, Netzteil, Akku voll/niedrig
+  3. Laden               -> Atmen fuer die ersten N Sekunden nach dem Einstecken
+  4. CPU-Last            -> Puls, Tempo abhaengig von der Last (nicht waehrend Tippen)
+  5. Basis               -> abends beim Tippen dim, sonst aus
+
+Keine externen Abhaengigkeiten (Python >= 3.11, brightnessctl).
+Aufruf:  kbd-fx [--config PFAD] [--demo]
+"""
+import argparse
+import asyncio
+import collections
+import copy
+import datetime as dt
+import os
+import signal
+import struct
+import sys
+import time
+import tomllib
+from pathlib import Path
+
+DEFAULTS = {
+    "device": {
+        "led": "platform::kbd_backlight",
+        "keyboard": "/dev/input/by-path/platform-i8042-serio-0-event-kbd",
+    },
+    "evening": {"start": "19:00", "end": "07:00", "typing_timeout": 5.0},
+    "cpu": {
+        "enabled": True,
+        "on": 70.0,
+        "off": 60.0,
+        "sustain": 5,
+        "period_slow": 1.5,
+        "period_fast": 0.3,
+    },
+    "battery": {
+        "enabled": True,
+        "warn": 20,
+        "critical": 10,
+        "breathe_seconds": 10.0,
+        "poll": 2.0,
+    },
+    "hyprland": {
+        "enabled": True,
+        "workspace": True,
+        "urgent": True,
+        "monitor": True,
+        "fullscreen": True,
+    },
+}
+
+HEARTBEAT = [(2, 0.12), (0, 0.12), (2, 0.12), (0, 1.64)]
+BREATHE = [(1, 0.4), (2, 0.6), (1, 0.4), (0, 0.6)]
+PLUG_PULSES = [(1, 0.1), (2, 0.15), (1, 0.1), (0, 0.15)] * 2
+
+EV_KEY = 1
+EVENT_FMT = "llHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FMT)
+
+
+def log(*a):
+    print(*a, file=sys.stderr, flush=True)
+
+
+def blink(n, level=2, on=0.12, off=0.12):
+    return [(lvl, d) for _ in range(n) for lvl, d in ((level, on), (0, off))]
+
+
+def merge(base, over):
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+def load_config(path):
+    cfg = copy.deepcopy(DEFAULTS)
+    p = Path(path)
+    if p.exists():
+        with p.open("rb") as f:
+            merge(cfg, tomllib.load(f))
+    return cfg
+
+
+def parse_hm(s):
+    h, m = s.split(":")
+    return dt.time(int(h), int(m))
+
+
+def rd(path, default=""):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return default
+
+
+class Daemon:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.led = cfg["device"]["led"]
+        self.led_path = f"/sys/class/leds/{self.led}/brightness"
+        try:
+            self.level = int(rd(self.led_path, "0"))
+        except ValueError:
+            self.level = None
+        self.wake = asyncio.Event()
+        self.overlays = collections.deque()
+        self.typing_until = 0.0
+        self.breathe_until = 0.0
+        self.cpu_pulse = False
+        self.cpu_load = 0.0
+        self.critical = False
+        self.plugged = False
+        self.last_ws_blink = 0.0
+        self.ev_start = parse_hm(cfg["evening"]["start"])
+        self.ev_end = parse_hm(cfg["evening"]["end"])
+
+    # ---------- Ausgabe ----------
+    async def set_level(self, n):
+        # gegen den echten Wert vergleichen (Fn-Taste/Resume koennen ihn aendern)
+        try:
+            if int(rd(self.led_path, "-1")) == n:
+                self.level = n
+                return
+        except ValueError:
+            pass
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "brightnessctl", "-q", "-d", self.led, "s", str(n)
+            )
+            rc = await proc.wait()
+        except OSError as e:
+            log("brightnessctl fehlgeschlagen:", e)
+            return
+        if rc == 0:
+            self.level = n
+        else:
+            log("brightnessctl rc =", rc)
+
+    async def wait_wake(self, timeout):
+        """True, wenn geweckt; False bei Timeout."""
+        try:
+            await asyncio.wait_for(self.wake.wait(), timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def play(self, steps, abortable=False):
+        for lvl, dur in steps:
+            await self.set_level(lvl)
+            if abortable:
+                if self.overlays or await self.wait_wake(dur):
+                    return
+            else:
+                await asyncio.sleep(dur)
+
+    def enqueue(self, steps):
+        if len(self.overlays) < 8:
+            self.overlays.append(steps)
+            self.wake.set()
+
+    # ---------- Zustand ----------
+    def is_evening(self):
+        now = dt.datetime.now().time()
+        if self.ev_start <= self.ev_end:
+            return self.ev_start <= now < self.ev_end
+        return now >= self.ev_start or now < self.ev_end
+
+    def pulse_period(self):
+        c = self.cfg["cpu"]
+        span = max(100.0 - c["on"], 1.0)
+        f = min(max((self.cpu_load - c["on"]) / span, 0.0), 1.0)
+        return c["period_slow"] - f * (c["period_slow"] - c["period_fast"])
+
+    async def render(self):
+        while True:
+            self.wake.clear()
+            if self.critical:
+                self.overlays.clear()
+                await self.play(HEARTBEAT, abortable=True)
+                continue
+            if self.overlays:
+                await self.play(self.overlays.popleft())
+                continue
+            now = time.monotonic()
+            typing = now < self.typing_until
+            base = 1 if (typing and self.is_evening()) else 0
+            if now < self.breathe_until and not typing:
+                await self.play(BREATHE, abortable=True)
+                continue
+            if self.cpu_pulse and not typing:
+                p = self.pulse_period()
+                await self.play([(2, 0.4 * p), (0, 0.6 * p)], abortable=True)
+                continue
+            await self.set_level(base)
+            timeout = 30.0
+            if typing:
+                timeout = min(timeout, self.typing_until - now + 0.05)
+            await self.wait_wake(timeout)
+
+    # ---------- Quellen ----------
+    async def input_task(self):
+        path = self.cfg["device"]["keyboard"]
+        timeout = self.cfg["evening"]["typing_timeout"]
+        loop = asyncio.get_running_loop()
+        warned = False
+        while True:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            except OSError as e:
+                if not warned:
+                    log(f"Tastatur {path} nicht lesbar ({e}); Tipp-Erkennung aus. "
+                        "User in Gruppe 'input'? (neu einloggen nach usermod)")
+                    warned = True
+                await asyncio.sleep(10)
+                continue
+            warned = False
+            closed = loop.create_future()
+
+            def cb():
+                try:
+                    data = os.read(fd, EVENT_SIZE * 64)
+                except BlockingIOError:
+                    return
+                except OSError:
+                    data = b""
+                if not data:
+                    loop.remove_reader(fd)
+                    if not closed.done():
+                        closed.set_result(None)
+                    return
+                pressed = False
+                for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                    _, _, typ, _, val = struct.unpack_from(EVENT_FMT, data, off)
+                    if typ == EV_KEY and val in (1, 2):
+                        pressed = True
+                if pressed:
+                    was = time.monotonic() < self.typing_until
+                    self.typing_until = time.monotonic() + timeout
+                    if not was:
+                        self.wake.set()
+
+            loop.add_reader(fd, cb)
+            log("Tipp-Erkennung aktiv:", path)
+            try:
+                await closed
+            finally:
+                try:
+                    loop.remove_reader(fd)
+                except Exception:
+                    pass
+                os.close(fd)
+            await asyncio.sleep(2)
+
+    async def cpu_task(self):
+        c = self.cfg["cpu"]
+
+        def stat():
+            parts = rd("/proc/stat").splitlines()[0].split()[1:9]
+            v = list(map(int, parts))
+            return sum(v), v[3] + v[4]
+
+        prev = stat()
+        above = 0
+        while True:
+            await asyncio.sleep(1)
+            cur = stat()
+            dtot, didle = cur[0] - prev[0], cur[1] - prev[1]
+            prev = cur
+            load = 100.0 * (1 - didle / dtot) if dtot > 0 else 0.0
+            self.cpu_load = load
+            above = above + 1 if load >= c["on"] else 0
+            was = self.cpu_pulse
+            if not was and above >= c["sustain"]:
+                self.cpu_pulse = True
+            elif was and load < c["off"]:
+                self.cpu_pulse = False
+            if self.cpu_pulse != was:
+                self.wake.set()
+
+    async def battery_task(self):
+        b = self.cfg["battery"]
+        root = Path("/sys/class/power_supply")
+        bat = ac = None
+        for p in sorted(root.iterdir()):
+            t = rd(p / "type")
+            if t == "Battery" and bat is None:
+                bat = p
+            elif t == "Mains" and ac is None:
+                ac = p
+        if bat is None:
+            log("Kein Akku gefunden, Akku-Effekte aus.")
+            return
+
+        def read():
+            cap = int(rd(bat / "capacity", "100") or 100)
+            status = rd(bat / "status")
+            plugged = (rd(ac / "online") == "1") if ac else status in ("Charging", "Full")
+            return cap, status, plugged
+
+        def bucket(c):  # aufrunden: Warnungen bei 20, 15, 10, 5
+            return -(-c // 5) * 5
+
+        def is_full(c, s):  # IdeaPad-Erhaltungsmodus: Netz dran, "Not charging" bei ~80 %
+            return c >= 100 or s in ("Full", "Not charging")
+
+        cap, status, self.plugged = read()
+        full_done = self.plugged and is_full(cap, status)
+        last_warn = None if self.plugged or cap > b["warn"] else bucket(cap)
+        self.critical = (not self.plugged) and cap <= b["critical"]
+        while True:
+            await asyncio.sleep(b["poll"])
+            cap, status, plugged = read()
+            if plugged != self.plugged:
+                self.plugged = plugged
+                if plugged:
+                    last_warn = None
+                    self.enqueue(PLUG_PULSES)
+                    self.breathe_until = time.monotonic() + b["breathe_seconds"]
+                else:
+                    full_done = False
+                    self.breathe_until = 0.0
+                    self.enqueue(blink(1, level=1, on=0.8))
+                self.wake.set()
+            if plugged:
+                if is_full(cap, status) and not full_done:
+                    full_done = True
+                    self.enqueue(blink(3, on=0.2, off=0.2))
+            elif cap <= b["warn"]:
+                lvl = bucket(cap)
+                if last_warn is None or lvl < last_warn:
+                    last_warn = lvl
+                    self.enqueue(blink(2, on=0.25, off=0.2))
+            crit = (not plugged) and cap <= b["critical"]
+            if crit != self.critical:
+                self.critical = crit
+                self.wake.set()
+
+    def hypr_socket(self):
+        rt = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+        sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+        base = Path(rt) / "hypr"
+        if sig and (base / sig / ".socket2.sock").exists():
+            return base / sig / ".socket2.sock"
+        socks = sorted(base.glob("*/.socket2.sock"), key=lambda p: p.stat().st_mtime)
+        if not socks:
+            raise FileNotFoundError("kein Hyprland-Socket")
+        return socks[-1]
+
+    def hypr_event(self, line):
+        h = self.cfg["hyprland"]
+        ev, _, _data = line.partition(">>")
+        now = time.monotonic()
+        if ev == "workspace" and h["workspace"]:
+            if now - self.last_ws_blink > 0.3:
+                self.last_ws_blink = now
+                self.enqueue(blink(1))
+        elif ev == "urgent" and h["urgent"]:
+            self.enqueue(blink(2))
+        elif ev in ("monitoradded", "monitorremoved") and h["monitor"]:
+            self.enqueue(blink(3))
+        elif ev == "fullscreen" and h["fullscreen"]:
+            self.enqueue(blink(1, on=0.5))
+
+    async def hypr_task(self):
+        while True:
+            try:
+                path = self.hypr_socket()
+                reader, writer = await asyncio.open_unix_connection(str(path))
+                log("Hyprland verbunden:", path)
+                async for raw in reader:
+                    self.hypr_event(raw.decode(errors="ignore").rstrip("\n"))
+                writer.close()
+            except Exception as e:  # inkl. ValueError bei zu langen Zeilen
+                if not isinstance(e, OSError):
+                    log("Hyprland-Task-Fehler:", repr(e))
+            await asyncio.sleep(2)
+
+
+async def supervise(name, factory):
+    """Startet eine Task bei Fehlern neu, statt den ganzen Daemon zu beenden."""
+    while True:
+        try:
+            await factory()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"Task {name} abgestuerzt: {e!r}; Neustart in 3s")
+            await asyncio.sleep(3)
+
+
+async def demo(d):
+    async def step(name, steps, abortable=False):
+        log("->", name)
+        await d.play(steps, abortable)
+        await d.set_level(0)
+        await asyncio.sleep(0.8)
+
+    await step("Netzteil rein (2 Pulse)", PLUG_PULSES)
+    await step("Atmen (3 Zyklen)", BREATHE * 3)
+    await step("Netzteil raus (langer Dim-Blink)", blink(1, level=1, on=0.8))
+    await step("Akku voll (3 Blinks)", blink(3, on=0.2, off=0.2))
+    await step("Akku-Warnung (2 Blinks)", blink(2, on=0.25, off=0.2))
+    await step("Hyprland: Workspace/Fullscreen/Urgent/Monitor",
+               blink(1) + [(0, 0.5)] + blink(1, on=0.5) + [(0, 0.5)]
+               + blink(2) + [(0, 0.5)] + blink(3))
+    for load in (70, 85, 100):
+        d.cpu_load = load
+        p = d.pulse_period()
+        await step(f"CPU-Puls bei {load} % (Periode {p:.2f}s)", [(2, 0.4 * p), (0, 0.6 * p)] * 4)
+    await step("Akku kritisch: Herzschlag (2 Zyklen)", HEARTBEAT * 2)
+    log("Demo fertig.")
+
+
+async def main_async(args):
+    cfg = load_config(args.config)
+    d = Daemon(cfg)
+    if args.demo:
+        await demo(d)
+        return
+    jobs = [("render", d.render), ("input", d.input_task)]
+    if cfg["cpu"]["enabled"]:
+        jobs.append(("cpu", d.cpu_task))
+    if cfg["battery"]["enabled"]:
+        jobs.append(("battery", d.battery_task))
+    if cfg["hyprland"]["enabled"]:
+        jobs.append(("hyprland", d.hypr_task))
+    tasks = [asyncio.create_task(supervise(n, f)) for n, f in jobs]
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, stop.set)
+    log("kbd-fx gestartet.")
+    await stop.wait()
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    await d.set_level(0)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--config", default=str(Path.home() / ".config/kbd-fx/config.toml"))
+    ap.add_argument("--demo", action="store_true", help="alle Effekte einmal vorfuehren")
+    asyncio.run(main_async(ap.parse_args()))
+
+
+if __name__ == "__main__":
+    main()
